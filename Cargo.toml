@@ -1,0 +1,16 @@
+[package]
+name = "bose-connect"
+version = "0.1.0"
+edition = "2024"
+description = "A client for the RFCOMM control protocol used by Bose headphones"
+license = "MIT"
+repository = "https://github.com/kaledcorona/bose-connect"
+keywords = ["bluetooth", "bose", "rfcomm", "headphones"]
+categories = ["hardware-support"]
+
+[[bin]]
+name = "bose-connect"
+path = "src/bin/bose-connect.rs"
+
+[dependencies]
+libc = "0.2.189"
