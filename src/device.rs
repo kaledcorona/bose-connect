@@ -1,45 +1,17 @@
-//! Identity, and what a given device can actually do.
+//! The two verbs.
 //!
-//! The protocol is shared across generations; the vocabulary is not. Noise
-//! cancelling lives at `01 06` on a QuietComfort 35 and at `01 05` on the Ultra
-//! family, which refuses the older opcode. Four of nine fields found on an Ultra
-//! do not exist on a 2016 device at all.
-//!
-//! Every implementation of this protocol so far has answered that with a table
-//! of device ids maintained by hand, and been wrong about every model its author
-//! did not own. This module asks the device instead.
+//! `get` and `set` carry every access in the crate. What differs between
+//! records lives in [`crate::catalog`]; what differs between models lives in
+//! [`crate::surface`]. Neither is a match arm here.
 
-use std::collections::BTreeSet;
-use std::io;
+use crate::catalog::{self, Field};
+use crate::error::{Error, Result};
+use crate::session::Session;
+use crate::surface::{Known, Surface};
+use crate::transport::Transport;
+use crate::wire::{Addr, Refusal};
 
-use crate::framing::{Message, Refusal};
-use crate::transport::{Session, Transport};
-
-/// Where a model keeps its noise-cancelling control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Anc {
-    /// `01 06`, payload `<level> <positions>`. QuietComfort 35.
-    Legacy,
-    /// `01 05`, payload `<positions> <awareness> <unknown>`. Ultra family.
-    ///
-    /// The value counts **awareness**, not cancellation: `0` is maximum
-    /// cancelling and `10` lets everything through.
-    Modern,
-    /// The Sport Earbuds have none, and say so.
-    Absent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Capabilities {
-    /// Functions that exist, whether or not they enumerate.
-    pub functions: BTreeSet<u8>,
-    pub anc: Anc,
-    pub equaliser: bool,
-    pub immersive: bool,
-    pub modes: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Identity {
     /// `0x400c`, `0x402D`, `0x4064`, `0x4066` so far. Equal to the product id
     /// in bluez's `Modalias`, so it can also be read without connecting.
@@ -48,7 +20,7 @@ pub struct Identity {
     /// `00 05`. **Not always the firmware version**: a QuietComfort 35 returns
     /// `3.0.3`, which is its firmware, while an Ultra returns a build string
     /// like `1.6.7+g6ebabd2`, which is not. Present it as a version string and
-    /// let the user decide what it means.
+    /// let the reader decide what it means.
     pub version: Option<String>,
     pub serial: Option<String>,
     /// `00 0f`. Only the Ultra generation answers; older models refuse, so a
@@ -59,89 +31,100 @@ pub struct Identity {
 pub struct Device<T: Transport> {
     session: Session<T>,
     pub identity: Identity,
-    pub capabilities: Capabilities,
+    pub surface: Surface,
 }
 
 impl<T: Transport> Device<T> {
     /// Interrogate a device over an already-open session.
-    pub fn open(mut session: Session<T>) -> io::Result<Self> {
-        let identity = Self::read_identity(&mut session)?;
-        let capabilities = Self::probe_capabilities(&mut session)?;
-        Ok(Device { session, identity, capabilities })
+    pub fn open(mut session: Session<T>) -> Result<Self> {
+        let surface = Surface::discover(&mut session)?;
+        let mut dev = Device { session, identity: Identity::default(), surface };
+        dev.identity = dev.read_identity();
+        Ok(dev)
     }
 
-    fn text(session: &mut Session<T>, function: u8, opcode: u8) -> io::Result<Option<String>> {
-        Ok(Self::payload(session, function, opcode)?
-            .map(|p| String::from_utf8_lossy(&p).trim_matches('\0').to_string()))
-    }
-
-    /// The payload of a successful read, or `None` for a refusal or silence.
-    fn payload(session: &mut Session<T>, function: u8, opcode: u8) -> io::Result<Option<Vec<u8>>> {
-        match session.request(&Message::get(function, opcode))? {
-            Some(msgs) => Ok(msgs
-                .into_iter()
-                .find(|m| m.function == function && m.opcode == opcode && m.refusal().is_none())
-                .map(|m| m.payload)),
-            None => Ok(None),
+    /// Read one record and decode it.
+    pub fn get<R, W>(&mut self, f: &Field<R, W>) -> Result<R> {
+        let addr = f.meta.addr;
+        if self.surface.state(addr) == Known::Absent {
+            return Err(Error::Absent(addr));
         }
-    }
-
-    fn read_identity(session: &mut Session<T>) -> io::Result<Identity> {
-        let (id, index) = match Self::payload(session, 0x00, 0x03)? {
-            Some(p) if p.len() >= 3 => (u16::from(p[0]) << 8 | u16::from(p[1]), p[2]),
-            _ => (0, 0),
-        };
-        Ok(Identity {
-            id,
-            index,
-            version: Self::text(session, 0x00, 0x05)?,
-            serial: Self::text(session, 0x00, 0x07)?,
-            model: Self::text(session, 0x00, 0x0f)?,
-        })
-    }
-
-    /// Ask which functions exist, then which of the interesting opcodes answer.
-    ///
-    /// Opcode `00` is every function's version and is never listed by an
-    /// enumeration, but it always answers — which makes it the cheapest probe
-    /// for whether a function is there at all.
-    fn probe_capabilities(session: &mut Session<T>) -> io::Result<Capabilities> {
-        let mut functions = BTreeSet::new();
-        for f in 0x00u8..=0x3f {
-            if Self::function_exists(session, f)? {
-                functions.insert(f);
+        match self.session.read(addr) {
+            Ok(bytes) => {
+                self.surface.settle(addr, true);
+                (f.decode)(&bytes).ok_or(Error::Malformed { addr, got: bytes })
+            }
+            Err(e) => {
+                if structural(&e) {
+                    self.surface.settle(addr, false);
+                }
+                Err(e)
             }
         }
-        let anc = if Self::answers(session, 0x01, 0x06)? {
-            Anc::Legacy
-        } else if Self::answers(session, 0x01, 0x05)? {
-            Anc::Modern
-        } else {
-            Anc::Absent
-        };
-        Ok(Capabilities {
-            equaliser: Self::answers(session, 0x01, 0x07)?,
-            immersive: Self::answers(session, 0x05, 0x0f)?,
-            modes: functions.contains(&0x1f),
-            functions,
-            anc,
-        })
     }
 
-    fn function_exists(session: &mut Session<T>, function: u8) -> io::Result<bool> {
-        match session.request(&Message::get(function, 0x00))? {
-            // Silence is not absence. It is its own case, seen on a QuietComfort
-            // 35 for a contiguous block of opcodes, and treating it as "missing"
-            // throws away the only signal that says whether to keep looking.
-            None => Ok(false),
-            Some(msgs) => Ok(!msgs
-                .iter()
-                .any(|m| m.refusal() == Some(Refusal::FunctionAbsent))),
+    /// Write one record, if the format is confirmed.
+    ///
+    /// The gate is the catalog's, not this function's: a format seen on the
+    /// wire but never shown to change anything carries its own refusal text and
+    /// cannot be sent. That is the reference's own lesson — **a capture
+    /// establishes the syntax, not the semantics** — held by the data rather
+    /// than by a match arm somebody has to remember to write.
+    pub fn set<R, W>(&mut self, f: &Field<R, W>, value: W) -> Result<()> {
+        let addr = f.meta.addr;
+        let Some(encode) = f.encode.filter(|_| f.meta.write.usable()) else {
+            return Err(Error::NotUnderstood { addr, why: f.meta.write.why() });
+        };
+        if self.surface.state(addr) == Known::Absent {
+            return Err(Error::Absent(addr));
+        }
+        self.session.write(addr, encode(value))
+    }
+
+    /// Whether the device is known to hold this record, without asking it.
+    ///
+    /// `false` for anything unproven, so a caller needing certainty reads
+    /// instead of guessing.
+    pub fn has<R, W>(&self, f: &Field<R, W>) -> bool {
+        self.surface.state(f.meta.addr) == Known::Live
+    }
+
+    fn read_identity(&mut self) -> Identity {
+        let (id, index) = self.get(&catalog::DEVICE_ID).map_or((0, 0), |d| (d.id, d.index));
+        Identity {
+            id,
+            index,
+            version: self.get(&catalog::VERSION).ok(),
+            serial: self.get(&catalog::SERIAL).ok(),
+            model: self.get(&catalog::MODEL).ok(),
         }
     }
 
-    fn answers(session: &mut Session<T>, function: u8, opcode: u8) -> io::Result<bool> {
-        Ok(Self::payload(session, function, opcode)?.is_some())
+    /// Read an address the catalog has no entry for.
+    ///
+    /// The exploration path. Everything the catalog knows started here.
+    pub fn raw(&mut self, addr: Addr) -> Result<Vec<u8>> {
+        self.session.read(addr)
+    }
+
+    /// Every function from `first` to `last` that answers, for mapping a model
+    /// this crate does not know.
+    ///
+    /// Slow by nature — a round trip each, and a silent function costs the whole
+    /// receive timeout. Every sweep in the reference stopped at `0x0f`, which is
+    /// why the mode table at `0x1f` went unfound through twenty-nine labelled
+    /// observations. There is no boundary in the protocol; pick one deliberately.
+    pub fn scan(&mut self, first: u8, last: u8) -> Result<Vec<u8>> {
+        (first..=last)
+            .filter_map(|f| match self.session.read(Addr::at(f, 0x00)) {
+                Ok(_) => Some(Ok(f)),
+                // `03` says the function is missing. `04` says the opcode is,
+                // which means the function is real and worth probing further.
+                Err(Error::Refused { why: Refusal::FunctionAbsent, .. } | Error::Silent(_)) => None,
+                Err(Error::Refused { .. }) => Some(Ok(f)),
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
     }
 
     pub fn session(&mut self) -> &mut Session<T> {
@@ -149,49 +132,25 @@ impl<T: Transport> Device<T> {
     }
 }
 
+/// Whether a failure says something permanent about the device.
+///
+/// A transient one must not be cached. `01 05` answers operator `04` around
+/// immersive-audio transitions and settles afterwards; remembering that would
+/// report an Ultra as having no noise cancelling for the rest of the session.
+fn structural(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Refused { why: Refusal::FunctionAbsent | Refusal::OpcodeAbsent, .. }
+            | Error::Silent(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::*;
+    use crate::fixtures;
     use crate::transport::Scripted;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-    }
-
-    /// A QuietComfort 35, as observed. Functions 00 01 02 03 04 05 08 09;
-    /// noise cancelling at `01 06`; no equaliser, no immersive, no modes.
-    fn qc35() -> Scripted {
-        let mut s = Scripted::new()
-            .on(&hex("00010100"), &hex("00010305312e302e34"))
-            .on(&hex("00030100"), &hex("00030303400c02"))
-            .on(&hex("00050100"), &hex("00050305332e302e33"))
-            .on(&hex("00070100"), &hex("0007030430303031"))
-            .on(&hex("01060100"), &hex("01060302010b"))
-            // The equaliser opcode does not refuse here — it says nothing.
-            .silent(&hex("01070100"));
-        for f in [0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x09] {
-            s = s.on(&[f, 0x00, 0x01, 0x00], &[f, 0x00, 0x03, 0x05, 0x31, 0x2e, 0x30, 0x2e, 0x31]);
-        }
-        s
-    }
-
-    /// A QuietComfort Ultra Headphones. Noise cancelling moved to `01 05`, the
-    /// old opcode refuses, and function 0x1f carries the modes.
-    fn ultra() -> Scripted {
-        let mut s = Scripted::new()
-            .on(&hex("00010100"), &hex("00010305312e322e30"))
-            .on(&hex("00030100"), &hex("00030303406601"))
-            .on(&hex("00050100"), &hex("0005030e312e362e372b6736656261626432"))
-            .on(&hex("000f0100"), &hex("000f0318426f736520514320556c747261204865616470686f6e6573"))
-            .on(&hex("01060100"), &hex("0106040104"))
-            .on(&hex("01050100"), &hex("010503030b0a03"))
-            .on(&hex("01070100"), &hex("0107030cf60a0200f60a0101f60a0202"))
-            .on(&hex("050f0100"), &hex("050f030100"));
-        for f in [0x00u8, 0x01, 0x02, 0x05, 0x06, 0x07, 0x1f] {
-            s = s.on(&[f, 0x00, 0x01, 0x00], &[f, 0x00, 0x03, 0x05, 0x31, 0x2e, 0x30, 0x2e, 0x30]);
-        }
-        s
-    }
 
     fn open(t: Scripted) -> Device<Scripted> {
         Device::open(Session::open(t).unwrap()).unwrap()
@@ -199,7 +158,7 @@ mod tests {
 
     #[test]
     fn identifies_a_qc35() {
-        let d = open(qc35());
+        let d = open(fixtures::qc35());
         assert_eq!(d.identity.id, 0x400c);
         assert_eq!(d.identity.version.as_deref(), Some("3.0.3"));
         // The model name opcode is Ultra-only; older devices refuse it, so a
@@ -209,39 +168,74 @@ mod tests {
 
     #[test]
     fn identifies_an_ultra_by_asking_rather_than_by_table() {
-        let d = open(ultra());
+        let d = open(fixtures::ultra_hp());
         assert_eq!(d.identity.id, 0x4066);
         assert_eq!(d.identity.model.as_deref(), Some("Bose QC Ultra Headphones"));
+        // The same opcode carries a different kind of version per generation.
+        assert_eq!(d.identity.version.as_deref(), Some("1.6.7+g6ebabd2"));
     }
 
     #[test]
-    fn finds_noise_cancelling_where_each_generation_keeps_it() {
-        assert_eq!(open(qc35()).capabilities.anc, Anc::Legacy);
-        assert_eq!(open(ultra()).capabilities.anc, Anc::Modern);
+    fn an_absent_record_costs_no_round_trip() {
+        // A QC35's function 01 enumerates and does not mention 07, so there is
+        // no equaliser — established without asking, where a direct probe would
+        // have waited out the whole receive timeout on a silent opcode.
+        let mut d = open(fixtures::qc35());
+        let before = d.session().transport_sent().len();
+        assert!(matches!(d.get(&EQUALISER), Err(Error::Absent(_))));
+        assert_eq!(d.session().transport_sent().len(), before);
     }
 
     #[test]
-    fn silence_on_the_equaliser_reads_as_absent_not_present() {
-        // A QC35 neither answers nor refuses `01 07`. Either misreading is a bug:
-        // "present" offers a control that will never respond.
-        assert!(!open(qc35()).capabilities.equaliser);
-        assert!(open(ultra()).capabilities.equaliser);
+    fn a_function_that_refuses_to_list_is_probed_rather_than_written_off() {
+        // Function 05 refuses the sweep on both generations and holds the
+        // volume on one and immersive audio on the other.
+        let mut d = open(fixtures::qc35());
+        assert!(d.get(&VOLUME).is_ok());
     }
 
     #[test]
-    fn features_that_arrived_with_the_ultra_are_not_claimed_for_older_models() {
-        let old = open(qc35()).capabilities;
-        assert!(!old.immersive);
-        assert!(!old.modes);
-        let new = open(ultra()).capabilities;
-        assert!(new.immersive);
-        assert!(new.modes);
+    fn silence_and_refusal_are_different_answers() {
+        let mut d = open(fixtures::qc35());
+        // `05 0f` refuses: the opcode is not on this model.
+        assert!(matches!(d.get(&IMMERSIVE), Err(Error::Refused { .. })));
+        // `01 07` says nothing at all, and the channel stays usable.
+        let mut d = open(fixtures::qc35());
+        d.surface.settle(Addr::at(0x01, 0x07), true); // bypass the listing
+        assert!(matches!(d.get(&EQUALISER), Err(Error::Silent(_))));
+        assert!(d.get(&ANC_NAMED).is_ok());
+    }
+
+    #[test]
+    fn a_transient_refusal_is_not_remembered() {
+        // `01 05` answers operator 04 around immersive-audio transitions and
+        // settles afterwards. Caching that reports an Ultra as having no noise
+        // cancelling for the rest of the session.
+        let mut d = open(fixtures::ultra_hp());
+        let addr = ANC_GRADED.meta.addr;
+        d.surface.settle(addr, false);
+        assert!(structural(&Error::Refused { addr, why: Refusal::OpcodeAbsent }));
+        assert!(!structural(&Error::Refused { addr, why: Refusal::Other(0x08) }));
+    }
+
+    #[test]
+    fn a_write_with_no_confirmed_format_is_refused_by_the_catalog() {
+        // Not by a match arm here. `1f 03` is accepted by the device and
+        // changes nothing, and the reason travels with the record.
+        let mut d = open(fixtures::ultra_hp());
+        let Err(Error::NotUnderstood { why, .. }) = d.set(&CURRENT_MODE, 1) else {
+            panic!("a write with no confirmed format was sent");
+        };
+        assert!(why.contains("changes nothing"));
+        // And `01 05` was never captured at all.
+        assert!(matches!(d.set(&ANC_GRADED, 5), Err(Error::NotUnderstood { .. })));
     }
 
     #[test]
     fn reports_the_functions_a_model_actually_has() {
-        let f = open(qc35()).capabilities.functions;
-        assert!(f.contains(&0x08));   // exists on the QC35
-        assert!(!f.contains(&0x1f));  // and not the modes function
+        let d = open(fixtures::qc35());
+        let f: Vec<u8> = d.surface.functions().collect();
+        assert!(f.contains(&0x04));
+        assert!(!f.contains(&0x1f)); // no modes on a 2016 device
     }
 }
