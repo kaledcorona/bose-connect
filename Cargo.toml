@@ -17,3 +17,8 @@ libc = "0.2.189"
 
 [features]
 mock = []
+
+# The binary's tests drive the fixtures; `cfg(test)` on the lib does not reach
+# a bin target, so enable them through the feature.
+[dev-dependencies]
+bose-connect = { path = ".", features = ["mock"] }

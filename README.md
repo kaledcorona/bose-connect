@@ -77,6 +77,11 @@ the model.
     3  Focus
     4  Home
 
+The channel probe runs on every call, four seconds a channel. Once `info`
+has printed the number, pass it and skip the probe:
+
+    $ bose-connect --channel 8 $QC35 battery
+
 Asking for something a model lacks says so, rather than timing out:
 
     $ bose-connect $QC35 eq
@@ -135,9 +140,11 @@ not the semantics.**
 Three commands need no per-record code, so they reach the parts the catalog has
 not named yet:
 
-    $ bose-connect $MAC catalog        # every record this build knows
-    $ bose-connect $MAC raw 07 01      # read one address, decoded by nobody
+    $ bose-connect catalog             # every record this build knows
+    $ bose-connect $MAC raw 1f 03      # read one address, decoded by nobody
     $ bose-connect $MAC scan           # which functions answer, 00-3f
+
+Addresses are hex, as `catalog` prints them; quantities are decimal.
 
 `scan` defaults to `00`–`3f` deliberately. Every sweep in the reference stopped
 at `0x0f`, which is why the mode table at `0x1f` went unfound through
@@ -251,7 +258,7 @@ does nothing would be worse than not offering it.
 
 ## Tests
 
-    cargo test        # 72, none need hardware
+    cargo test        # 85, none need hardware
 
 ## Licence
 
