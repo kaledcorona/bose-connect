@@ -1,7 +1,8 @@
 <img src="assets/banner.svg" alt="bose-connect" width="820">
 
 Implements the [bose-rfcomm](https://github.com/kaledcorona/bose-rfcomm)
-protocol, tested on a QuietComfort 35 and QuietComfort Ultra Headphones.
+protocol, mapped from four devices across two generations: the QuietComfort 35,
+Sport Earbuds, QC Earbuds II, and QC Ultra Headphones.
 
 ## Why
 
@@ -39,7 +40,7 @@ Find a paired device, or use its address straight:
     functions 00 01 02 04 05 07 1f
     immersive off
 
-Two models, one command, different answers — read from the opcode each model
+One command, two models, different answers — read from the opcode each model
 uses, with the accepted levels from the device's own bitmask:
 
     $ bose-connect $ULTRA anc
@@ -48,7 +49,7 @@ uses, with the accepted levels from the device's own bitmask:
     high  (accepts off, high, low)
     $ bose-connect $QC35 anc low
 
-The equaliser's ranges come from the device, so a client can draw the control
+The equaliser's ranges come from the device, so a client draws the control
 without knowing the model:
 
     $ bose-connect $ULTRA eq
@@ -62,7 +63,7 @@ without knowing the model:
     $ bose-connect $QC35 volume 8
     $ bose-connect $QC35 auto-off never
 
-Modes, on the Ultra generation — list, and switch:
+List and switch modes, on the Ultra generation:
 
     $ bose-connect $ULTRA modes
     0  Quiet
@@ -72,14 +73,14 @@ Modes, on the Ultra generation — list, and switch:
     4  Home
     $ bose-connect $ULTRA mode 3               # switch to Focus
 
-The Ultra has no cancellation dial: `01 05` refuses a direct write, so on it
-cancellation lives in a **mode** — edit one's level, or select a mode that has
-the level you want. Creating and editing a mode is a library call (`save_mode`);
-a libadwaita front-end puts it behind a form.
+The Ultra has no cancellation dial: `01 05` refuses a write, so its cancellation
+lives in a mode — edit a mode's level, or select one that already has the level
+you want. Building and editing modes is a library call (`save_mode`); a
+libadwaita front-end puts it behind a form.
 
 The channel probe runs once, four seconds a channel, and the answer is cached
 under `$XDG_CACHE_HOME/bose-connect/`; `--channel N` skips both. Asking for
-something a model lacks says so, without a round trip — the QC35's function `01`
+something a model lacks says so without a round trip — the QC35's function `01`
 enumerates and never mentions `07`:
 
     $ bose-connect $QC35 eq
@@ -94,9 +95,7 @@ named yet:
     $ bose-connect $MAC raw 1f 03      # read one address, decoded by nobody
     $ bose-connect $MAC scan           # which functions answer, 00-3f
 
-Addresses are hex, as `catalog` prints them; quantities are decimal. `scan`
-defaults to `00`–`3f`: every sweep in the reference stopped at `0x0f`, which is
-why the mode table at `0x1f` went unfound through twenty-nine observations.
+Addresses are hex, as `catalog` prints them; quantities are decimal.
 
 ### Scripting
 
@@ -127,43 +126,33 @@ if info["battery"]:
 
 ## How to contribute
 
-The protocol is still being discovered, and a new finding is **one catalog
-entry** in `src/catalog.rs`, in the same shape as the reference's own tables:
+The vendor documents none of this, so the most useful contribution is a device
+this project has not mapped. Bugs and patches are welcome too.
 
-```rust
-AUTO_AWARE: bool = (0x01, 0x1d) "auto aware mode"
-    read  Confirmed, codec::flag,
-    write Unknown,   None,
-    note  "drops the mode to transparency on its own";
-```
+**Open an issue** to report a bug, ask for a control, or share what a device does
+on the wire. For a protocol observation, include the model from `bose-connect
+info` and the output of `bose-connect $MAC scan` with any `raw <fn> <op>` reads —
+that is enough to place a new record.
 
-That is the whole change: the surface probe picks it up, `bose-connect catalog`
-lists it, `cargo doc` documents it, and `dev.get(&AUTO_AWARE)` works. Add the
-bytes you observed to the matching device in `src/fixtures.rs` and the suite
-covers it without hardware.
+**Send a pull request** by forking, branching off `main`, and keeping one topic
+per PR. Run `cargo test` and `cargo clippy` first; both are clean on `main`. The
+project follows [GitHub flow](https://docs.github.com/en/get-started/using-github/github-flow),
+and commit subjects are imperative and specific — "Correct the operators", not
+"fix stuff".
 
-**Evidence is part of the record.** `read` and `write` each carry how well that
-direction is understood, and only `Confirmed` is writable:
-
-| | |
-|---|---|
-| `Confirmed` | a write changed what a read returned |
-| `Syntax("…")` | seen on the wire; the effect was never verified |
-| `Ineffective("…")` | the form is accepted and changes nothing |
-| `Unknown` | no format |
-
-So the writes this crate refuses are not special cases in the code — they are
-table entries, and the string is the error the user reads. That encodes the
-reference's own lesson: **a capture establishes the syntax, not the semantics.**
+A protocol finding is usually one entry in `src/catalog.rs`. The [contributor
+guide](https://github.com/kaledcorona/bose-connect/wiki/Contributing) covers the
+record shape, the evidence that gates a write, and the fixtures that test it
+without hardware.
 
 ## As a library
 
 Two verbs carry everything — `get` and `set` — and a named accessor is one line
 over them. `Transport` is a trait, so the protocol drives from recorded traffic
-as readily as from a socket, which is how the tests cover three device models
-with none present.
+as readily as from a socket, which is how the tests cover both generations with
+no device present.
 
-The **[library guide](https://github.com/kaledcorona/bose-connect/wiki/Library)**
+The [library guide](https://github.com/kaledcorona/bose-connect/wiki/Library)
 covers the eight layers, the fixtures, and the three-answer error model — a
 request gets a value, a refusal, or silence, and the three are not the same.
 
