@@ -19,7 +19,8 @@ with the differences handled rather than assumed.
 
     cargo build --release
 
-Needs `bluez`. Pair the headphones first with `bluetoothctl`.
+Needs `bluez`. Pair the headphones first with `bluetoothctl`. Add
+`--features bluez` for `bose-connect devices`.
 
 ## Examples
 
@@ -77,8 +78,8 @@ the model.
     3  Focus
     4  Home
 
-The channel probe runs on every call, four seconds a channel. Once `info`
-has printed the number, pass it and skip the probe:
+The channel probe runs once per device, four seconds a channel, and the
+answer is kept under `$XDG_CACHE_HOME/bose-connect/`. To bypass both:
 
     $ bose-connect --channel 8 $QC35 battery
 
@@ -134,6 +135,15 @@ they are table entries, and the string is the error the user reads:
 
 That encodes the reference's own lesson: **a capture establishes the syntax,
 not the semantics.**
+
+## Finding the address
+
+    $ bose-connect devices
+    AA:BB:CC:00:00:01  009e:4066  Bose QC Ultra Headphones     connected
+
+Reads what bluez has paired; pairing itself stays with `bluetoothctl`. Needs
+`--features bluez`, which brings a D-Bus stack the rest of the crate does not
+need, so it is off by default.
 
 ## Exploring
 
@@ -258,7 +268,11 @@ does nothing would be worse than not offering it.
 
 ## Tests
 
-    cargo test        # 85, none need hardware
+    cargo test        # 89, none need hardware
+
+## Roadmap
+
+See `ROADMAP.md`. Captures wanted are listed first; each is one catalog entry away from a feature.
 
 ## Licence
 

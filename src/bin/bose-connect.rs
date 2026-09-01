@@ -17,13 +17,13 @@ use bose_connect::codec::{AutoOff, Immersive, Language, Level};
 use bose_connect::device::Device;
 use bose_connect::error::Result;
 use bose_connect::session::Session;
-use bose_connect::transport::{probe_channel, Address, Rfcomm, Transport};
+use bose_connect::transport::{self, Address, Rfcomm, Transport};
 use bose_connect::wire::{hex, Addr};
 
 const TIMEOUT: Duration = Duration::from_secs(4);
 
 const USAGE: &str = "usage: bose-connect [--channel N] <address> <command>
-       bose-connect catalog | --help | --version
+       bose-connect catalog | devices | --help | --version
 
   info              identity and what this model supports
   json              the same, machine-readable
@@ -48,10 +48,12 @@ const USAGE: &str = "usage: bose-connect [--channel N] <address> <command>
   active            the host holding the link
 
   catalog           every record this build knows, and how well
+  devices           paired Bose devices, from bluez (needs the bluez feature)
   raw <fn> <op>     read one address, decoded by nobody; hex
   scan [first last] which functions answer; hex, defaults to 00-3f
 
-  --channel N       skip the probe; `info` prints the number to use";
+  --channel N       use this channel; otherwise the last one that answered,
+                    or a probe";
 
 /// One invocation, fully decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +61,7 @@ enum Cmd {
     Help,
     Version,
     Catalog,
+    Devices,
     Info,
     Json,
     Anc(Option<Level>),
@@ -80,7 +83,7 @@ enum Cmd {
 
 impl Cmd {
     fn needs_device(&self) -> bool {
-        !matches!(self, Cmd::Help | Cmd::Version | Cmd::Catalog)
+        !matches!(self, Cmd::Help | Cmd::Version | Cmd::Catalog | Cmd::Devices)
     }
 }
 
@@ -110,6 +113,7 @@ fn parse(args: &[String]) -> std::result::Result<Invocation, Usage> {
         "--help" | "-h" | "help" => return Ok(Invocation { addr: None, channel, cmd: Cmd::Help }),
         "--version" | "-V" => return Ok(Invocation { addr: None, channel, cmd: Cmd::Version }),
         "catalog" => return Ok(Invocation { addr: None, channel, cmd: Cmd::Catalog }),
+        "devices" => return Ok(Invocation { addr: None, channel, cmd: Cmd::Devices }),
         _ => {}
     }
     let [addr, cmd, rest @ ..] = rest else { return Err(USAGE.into()) };
@@ -221,6 +225,7 @@ fn main() {
         Cmd::Help => writeln!(out, "{USAGE}").map_err(Into::into),
         Cmd::Version => writeln!(out, "bose-connect {}", env!("CARGO_PKG_VERSION")).map_err(Into::into),
         Cmd::Catalog => print_catalog(&mut out).map_err(Into::into),
+        Cmd::Devices => devices(&mut out),
         _ => connect_and_run(&inv, &mut out),
     };
     match done {
@@ -240,7 +245,7 @@ fn connect_and_run(inv: &Invocation, out: &mut impl Write) -> Result<()> {
     let addr = inv.addr.expect("a device command carries an address");
     let (channel, session) = match inv.channel {
         Some(c) => (c, Session::open(Rfcomm::connect(addr, c, TIMEOUT)?)?),
-        None => probe_channel(addr, TIMEOUT)?,
+        None => transport::connect(addr, TIMEOUT)?,
     };
     let mut dev = Device::open(session)?;
     run(&inv.cmd, &mut dev, channel, out)
@@ -249,7 +254,9 @@ fn connect_and_run(inv: &Invocation, out: &mut impl Write) -> Result<()> {
 /// Dispatch. Generic over the transport so the fixtures can drive it.
 fn run<T: Transport>(cmd: &Cmd, dev: &mut Device<T>, channel: u8, out: &mut impl Write) -> Result<()> {
     match cmd {
-        Cmd::Help | Cmd::Version | Cmd::Catalog => unreachable!("answered without a device"),
+        Cmd::Help | Cmd::Version | Cmd::Catalog | Cmd::Devices => {
+            unreachable!("answered without a device")
+        }
         Cmd::Info => info(dev, channel, out)?,
         Cmd::Json => json(dev, channel, out)?,
         Cmd::Anc(None) => anc(dev, out)?,
@@ -440,6 +447,27 @@ fn json<T: Transport>(dev: &mut Device<T>, channel: u8, out: &mut impl Write) ->
     Ok(())
 }
 
+#[cfg(feature = "bluez")]
+fn devices(out: &mut impl Write) -> Result<()> {
+    for p in transport::bluez::bose()? {
+        let ids = match (p.vendor, p.product) {
+            (Some(v), Some(pr)) => format!("{v:04x}:{pr:04x}"),
+            _ => "-".into(),
+        };
+        let state = if p.connected { "connected" } else { "" };
+        writeln!(out, "{}  {ids}  {:<28} {state}", p.address, p.name)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "bluez"))]
+fn devices(_: &mut impl Write) -> Result<()> {
+    Err(bose_connect::error::Error::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "built without the bluez feature; pass the address",
+    )))
+}
+
 /// The catalog, as a table. `cargo doc` renders the same facts; this is for
 /// when the question is what a *build* knows, in a terminal, next to a device.
 fn print_catalog(out: &mut impl Write) -> io::Result<()> {
@@ -540,6 +568,7 @@ mod tests {
         assert_eq!(cmd(&format!("{MAC} catalog")), Cmd::Catalog);
         assert_eq!(cmd("--help"), Cmd::Help);
         assert_eq!(cmd("--version"), Cmd::Version);
+        assert_eq!(cmd("devices"), Cmd::Devices);
         assert!(!Cmd::Catalog.needs_device() && Cmd::Info.needs_device());
     }
 

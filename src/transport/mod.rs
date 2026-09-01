@@ -7,12 +7,14 @@
 
 use std::io;
 
+#[cfg(feature = "bluez")]
+pub mod bluez;
 pub mod mock;
 pub mod probe;
 pub mod rfcomm;
 
 pub use mock::{Replay, Scripted};
-pub use probe::probe_channel;
+pub use probe::{cached_channel, connect, probe_channel, remember_channel};
 pub use rfcomm::{Address, Rfcomm};
 
 

@@ -5,11 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A Rust client for the Bose RFCOMM control protocol. The protocol description it
 implements lives at <https://github.com/kaledcorona/bose-rfcomm> ("the
 reference"); where the two disagree, the reference wins. Edition 2024, `libc`
-the only dependency.
+the only default dependency; `zbus` only behind `--features bluez`.
 
 ## Commands
 
-    cargo test                                   # 85 tests, none need hardware
+    cargo test                                   # 89 tests, none need hardware
+    cargo test --features bluez                  # +2, the D-Bus listing's pure parts
     cargo test wire::tests::encodes_a_read       # one test, by module path
     cargo test catalog::                         # one module
     cargo build --release
@@ -30,6 +31,7 @@ One direction, each knowing only the one below. A change that makes a lower
 layer reach upward is the wrong change.
 
     transport   bytes                                    src/transport/
+                (+ bluez listing and channel cache, both side doors)
     session     bytes → records, one exchange            src/session.rs
     wire        records ↔ payloads                       src/wire.rs
     codec       payloads ↔ values                        src/codec.rs
@@ -86,6 +88,16 @@ update) and returns the *open session*, not the channel number: closing and
 reconnecting races the kernel releasing the channel and surfaces as `EBUSY`.
 `EHOSTDOWN`/`EHOSTUNREACH`/`ETIMEDOUT` end the scan rather than costing thirty
 timeouts. Scan once and keep the answer.
+
+**Notifications are kept, not dropped.** Operator `00` records the device
+volunteers (earcup buttons) land in `Session::notices`; `Session::poll` waits
+one timeout for more. A GUI showing live state reads these and re-reads the
+record — the notice's payload shape is not confirmed per model.
+
+**`transport::connect` is what clients call.** It tries the cached channel
+(`$XDG_CACHE_HOME/bose-connect/<mac>`), falls back to `probe_channel`, and
+remembers the answer. `probe_channel` alone is for tooling that wants a fresh
+scan.
 
 **RFCOMM is a stream.** `Session` holds a `pending` buffer: replies split across
 reads and two replies in one read both happen. Mock transports imitate this —

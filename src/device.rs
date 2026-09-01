@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::session::Session;
 use crate::surface::{Known, Surface};
 use crate::transport::Transport;
-use crate::wire::{Addr, Refusal};
+use crate::wire::{Addr, Message, Refusal};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Identity {
@@ -129,6 +129,16 @@ impl<T: Transport> Device<T> {
 
     pub fn session(&mut self) -> &mut Session<T> {
         &mut self.session
+    }
+
+    /// Records the device volunteered since the last call — button presses,
+    /// state changes — decoded against the catalog where it has an entry.
+    ///
+    /// Not yet matched to a capture on every model: the address is reliable,
+    /// the payload shape is whatever the status record's shape is, which is
+    /// why this hands back the raw record and lets a caller re-read the value.
+    pub fn notices(&mut self) -> Vec<Message> {
+        self.session.notices()
     }
 }
 

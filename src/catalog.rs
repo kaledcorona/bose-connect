@@ -154,7 +154,7 @@ catalog! {
     NAME: String = (0x01, 0x02) "name"
         read  Confirmed, codec::name,
         write Confirmed, Some(codec::set_name),
-        note  "read carries a leading 00, the write does not; lives in firmware";
+        note  "read carries a leading 00, the write does not; lives in firmware. An Ultra dropped and re-established the link after the write, taking A2DP down with it";
 
     PROMPTS: Prompts | (Language, bool) = (0x01, 0x03) "language and battery announcement"
         read  Confirmed, codec::prompts,

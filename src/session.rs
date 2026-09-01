@@ -31,6 +31,11 @@ pub struct Session<T: Transport> {
     transport: T,
     /// Bytes read but not yet consumed.
     pending: Vec<u8>,
+    /// Records the device volunteered — operator `00` — that no request was
+    /// waiting for. A button press on the earcup arrives this way. Kept until
+    /// [`Session::notices`] takes them, so a client showing live state sees
+    /// what changed under it.
+    notices: Vec<Message>,
 }
 
 impl<T: Transport> Session<T> {
@@ -44,7 +49,7 @@ impl<T: Transport> Session<T> {
         // Wanted only for its side effect; a device that stays quiet here may
         // still answer everything afterwards.
         let _ = transport.recv(&mut buf);
-        Ok(Session { transport, pending: Vec::new() })
+        Ok(Session { transport, pending: Vec::new(), notices: Vec::new() })
     }
 
     /// Read one record. The payload, or the reason there is none.
@@ -122,9 +127,48 @@ impl<T: Transport> Session<T> {
         });
         // Consumed either way. Records for other addresses are notifications or
         // leftovers: keeping them would serve one as the next request's answer,
-        // and giving up on them would abandon a reply still on its way.
+        // and giving up on them would abandon a reply still on its way. The
+        // notifications are worth something, though, so they are set aside.
+        self.keep_notices(&msgs);
         self.pending.clear();
         found
+    }
+
+    fn keep_notices(&mut self, msgs: &[Message]) {
+        self.notices.extend(msgs.iter().filter(|m| m.operator == Operator::Notify).cloned());
+    }
+
+    /// Wait one receive timeout for anything the device volunteers.
+    ///
+    /// For a client that shows state rather than asking for it once: between
+    /// requests the socket is idle, and a button press on the device arrives as
+    /// an operator-`00` record nobody asked for. Returns what arrived, which is
+    /// usually nothing. Records other than notifications are dropped here —
+    /// there is no request they could answer.
+    pub fn poll(&mut self) -> Result<Vec<Message>> {
+        let mut chunk = [0u8; 1024];
+        match self.transport.recv(&mut chunk) {
+            Ok(0) => {
+                return Err(Error::Io(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "device closed the connection",
+                )))
+            }
+            Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::TimedOut => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+        // A partial record stays pending for the next read to complete.
+        if let Ok(msgs) = decode(&self.pending) {
+            self.keep_notices(&msgs);
+            self.pending.clear();
+        }
+        Ok(self.notices())
+    }
+
+    /// Everything the device has volunteered since the last call.
+    pub fn notices(&mut self) -> Vec<Message> {
+        std::mem::take(&mut self.notices)
     }
 
     /// Ask a function to list itself, reading until it says it has finished.
@@ -170,7 +214,9 @@ impl<T: Transport> Session<T> {
         if acc.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(decode(&acc)?)
+        let msgs = decode(&acc)?;
+        self.keep_notices(&msgs);
+        Ok(msgs)
     }
 
     /// What a function said when asked to list itself.
@@ -277,7 +323,7 @@ mod tests {
     }
 
     fn dribbling(reply: &str) -> Session<Dribble> {
-        Session { transport: Dribble { reply: h(reply), at: 0 }, pending: Vec::new() }
+        Session { transport: Dribble { reply: h(reply), at: 0 }, pending: Vec::new(), notices: Vec::new() }
     }
 
     #[test]
@@ -293,6 +339,30 @@ mod tests {
         // parses answers a question the device was never asked.
         let mut s = dribbling("030100030fbfe401060302010b");
         assert_eq!(s.read(ANC).unwrap(), vec![0x01, 0x0b]);
+        // And it is not lost either: it is what a client showing live state
+        // is waiting for.
+        let n = s.notices();
+        assert_eq!(n.len(), 1);
+        assert_eq!((n[0].addr, n[0].operator), (Addr::at(0x03, 0x01), Operator::Notify));
+        assert!(s.notices().is_empty());
+    }
+
+    #[test]
+    fn polling_an_idle_device_returns_nothing_and_no_error() {
+        // Silence between requests is the normal state, not `Silent`.
+        let t = Replay::new(vec![Some(h("00010305312e302e34")), None]);
+        let mut s = Session::open(t).unwrap();
+        assert!(s.poll().unwrap().is_empty());
+    }
+
+    #[test]
+    fn polling_collects_what_the_device_volunteers() {
+        // An earcup button press: `01 06 00 02 01 0b`, nobody asked.
+        let t = Replay::new(vec![Some(h("00010305312e302e34")), Some(h("01060002010b"))]);
+        let mut s = Session::open(t).unwrap();
+        let n = s.poll().unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].payload, h("010b"));
     }
 
     struct Closed;
@@ -310,7 +380,7 @@ mod tests {
         // Ok(0) decoded to an empty message list, which contains no refusal,
         // which made every capability probe answer "present". Headphones that
         // power off mid-probe produced a plausible-looking device.
-        let mut s = Session { transport: Closed, pending: Vec::new() };
+        let mut s = Session { transport: Closed, pending: Vec::new(), notices: Vec::new() };
         let Err(Error::Io(e)) = s.read(Addr::at(0x00, 0x03)) else {
             panic!("expected an io error");
         };
@@ -346,7 +416,7 @@ mod tests {
 
     #[test]
     fn an_enumeration_that_never_ends_is_an_error_not_a_hang() {
-        let mut s = Session { transport: Flood, pending: Vec::new() };
+        let mut s = Session { transport: Flood, pending: Vec::new(), notices: Vec::new() };
         let Err(Error::Io(e)) = s.enumerate(0x1f) else {
             panic!("expected an io error");
         };

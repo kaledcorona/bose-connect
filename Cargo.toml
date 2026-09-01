@@ -14,9 +14,11 @@ path = "src/bin/bose-connect.rs"
 
 [dependencies]
 libc = "0.2.189"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"], optional = true }
 
 [features]
 mock = []
+bluez = ["dep:zbus"]
 
 # The binary's tests drive the fixtures; `cfg(test)` on the lib does not reach
 # a bin target, so enable them through the feature.

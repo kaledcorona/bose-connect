@@ -1,9 +1,8 @@
-//! The four observed devices, as data.
+//! The observed devices, as data.
 //!
 //! Transcribed from the reference so that a code path can be exercised without
 //! the hardware it was found on — which matters here, because covering the
-//! protocol needs four headphones from two generations and most people have
-//! one.
+//! protocol needs headphones from two generations and most people have one.
 //!
 //! A new finding lands here as one line beside its catalog entry.
 
