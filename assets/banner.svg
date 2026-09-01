@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" font-family="'DejaVu Sans Mono','JetBrains Mono',ui-monospace,monospace">
+  <rect width="1200" height="300" fill="#f3ede1"/>
+  <text x="90" y="150" font-size="66" font-weight="700" fill="#2a251f" letter-spacing="1">bose-connect</text>
+  <!-- one restrained hinoki accent, seated under the wordmark -->
+  <rect x="92" y="168" width="150" height="3" fill="#b9995e"/>
+  <text x="92" y="205" font-size="23" fill="#7c736a">Your Bose headphones on Linux — no app, no account, no dropped models.</text>
+  <!-- symbolism: the real control frame, as a faint watermark -->
+  <text x="90" y="262" font-size="17" fill="#cbc1af" letter-spacing="2">43 ef 0b · 01 06 02 01 03 · 24</text>
+  <text x="90" y="283" font-size="12.5" fill="#d7cdbb" letter-spacing="1">host → device   ·   function opcode operator len payload   ·   fcs</text>
+</svg>
