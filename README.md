@@ -15,12 +15,15 @@ channel, so they are wrong about any model their author did not own.
 This asks the device instead. Same code path for a 2016 QC35 and a 2023 Ultra,
 with the differences handled rather than assumed.
 
-## Build
+## Install
 
-    cargo build --release
+    cargo install --path .                     # into ~/.cargo/bin
+    cargo install --path . --features bluez    # + the `devices` subcommand
 
-Needs `bluez`. Pair the headphones first with `bluetoothctl`. Add
-`--features bluez` for `bose-connect devices`.
+Or build in place with `cargo build --release` and run
+`target/release/bose-connect`. Either way `bluez` is needed at runtime, and the
+headphones paired first with `bluetoothctl`. The `bluez` feature adds
+`bose-connect devices` and the D-Bus stack it needs, so it is off by default.
 
 ## Examples
 
@@ -77,6 +80,11 @@ the model.
     2  Immersion
     3  Focus
     4  Home
+    $ bose-connect $ULTRA mode 3        # switch to it
+
+Creating and editing a mode — its name, cancellation, wind block, spatial audio
+and spoken prompt — is a library call (`save_mode`); a libadwaita front-end puts
+it behind a form.
 
 The channel probe runs once per device, four seconds a channel, and the
 answer is kept under `$XDG_CACHE_HOME/bose-connect/`. To bypass both:
@@ -98,18 +106,18 @@ The protocol is still being discovered. A new record is **one entry**, in
 `src/catalog.rs`, in the same shape as the reference's own tables:
 
 ```rust
-WIND_BLOCK: bool = (0x1f, 0x0b) "wind block"
+AUTO_AWARE: bool = (0x01, 0x1d) "auto aware mode"
     read  Confirmed, codec::flag,
     write Unknown,   None,
-    note  "forces cancellation to maximum while on";
+    note  "drops the mode to transparency on its own";
 ```
 
 That is the whole change. The surface probe picks it up, `bose-connect catalog`
-lists it, `cargo doc` documents it, and `dev.get(&WIND_BLOCK)` works. A name in
+lists it, `cargo doc` documents it, and `dev.get(&AUTO_AWARE)` works. A name in
 `src/api.rs` is optional and one line:
 
 ```rust
-pub fn wind_block(&mut self) -> Result<bool> { self.get(&WIND_BLOCK) }
+pub fn auto_aware(&mut self) -> Result<bool> { self.get(&AUTO_AWARE) }
 ```
 
 Add the bytes you observed to the matching device in `src/fixtures.rs` and the
@@ -127,11 +135,15 @@ test suite covers it without hardware.
 | `Ineffective("…")` | the form is accepted and changes nothing |
 | `Unknown` | no format |
 
-So the two operations this crate refuses are not special cases in the code —
-they are table entries, and the string is the error the user reads:
+So a write the crate will not make is not a special case in the code — it is a
+table entry, and its reason string is the error the user reads.
 
-    $ bose-connect $ULTRA mode 1
-    bose-connect: 1f 03: the app's form is accepted and changes nothing, for every index
+Mode selection is the case that earned this its keep. The app's captured form sat
+as `Ineffective` — refused rather than sent — until the real form, a `Start`
+carrying the index and prompt, was confirmed against a device. It is a working
+verb now. The one write still refused is setting cancellation on an Ultra: its
+`01 05` format was never captured, so the catalog marks it `Unknown` and
+`dev.set` returns the reason rather than send a guess.
 
 That encodes the reference's own lesson: **a capture establishes the syntax,
 not the semantics.**
@@ -195,80 +207,30 @@ if info["anc"] == "named":
     bose(MAC, "anc", "low")
 ```
 
-## As a Rust library
+## As a library
 
-Two verbs carry everything. Named accessors are one line over them.
+Two verbs carry everything — `get` and `set` — and a named accessor is one line
+over them. `Transport` is a trait, so the protocol drives from recorded traffic
+as readily as from a socket, which is how the tests cover three device models
+with none present.
 
-```rust
-use bose_connect::api::Anc;
-use bose_connect::catalog::{BATTERY, VOLUME};
-use bose_connect::codec::Level;
-use bose_connect::device::Device;
-use bose_connect::transport::{probe_channel, Address};
-
-let addr: Address = "AA:BB:CC:00:00:01".parse()?;
-let (_channel, session) = probe_channel(addr, TIMEOUT)?;
-let mut dev = Device::open(session)?;
-
-// By name, or straight from the catalog — the same code path.
-let cells = dev.battery()?;
-let vol   = dev.get(&VOLUME)?;
-dev.set(&VOLUME, 8)?;
-
-match dev.noise_cancelling()? {
-    Anc::Named(a) if a.accepts(Level::Low) => dev.set_level(Level::Low)?,
-    Anc::Named(_)  => {}
-    Anc::Graded(a) => println!("cancelling {} of {}", a.cancelling(), a.top()),
-}
-```
-
-### Layers
-
-One direction, each knowing only the one below:
-
-    transport   bytes
-    session     bytes → records, one exchange
-    wire        records ↔ payloads
-    codec       payloads ↔ values
-    catalog     which value lives where, and how well we know it
-    surface     which of those this device answers
-    device      get / set — the only two verbs
-    api         names for the verbs
-
-`Transport` is a trait, so the protocol can be driven from recorded traffic
-instead of a socket. `src/fixtures.rs` holds four devices from two generations
-as data, which is how the tests cover both without either device present. Build
-with `--features mock` to use them from your own tests.
-
-### Three answers, not two
-
-A request gets a reply, a refusal, or **nothing at all**, and the three are
-different:
-
-| behaviour | `Error` |
-|---|---|
-| a value | — |
-| `04` + `03` / `04` | `Refused`, or `Absent` if the surface knew already |
-| silence | `Silent` |
-
-Reading silence as "busy" invites a retry loop against an opcode that will
-never answer; reading it as "unsupported" throws away the refusal codes, which
-are the only signal for whether a function is worth probing further.
+The **[library guide](https://github.com/kaledcorona/bose-connect/wiki/Library)**
+covers the eight layers, the fixtures, and the three-answer error model — a
+request gets a value, a refusal, or silence, and the three are not the same.
 
 ## Limits
 
 **Setting cancellation on an Ultra.** No capture of the official app writing
-`01 05` exists, so the format would be a guess.
+`01 05` exists, so the format would be a guess. It sits in the catalog as
+`Unknown`, and the crate refuses it rather than send one.
 
-**Selecting a mode.** The form the app sends is accepted by the device and
-changes nothing, for every index. Reading the active mode works.
-
-Both are in the catalog with their reasons. Offering a control that silently
-does nothing would be worse than not offering it.
+Selecting, creating and editing modes — once listed here — are done. A control
+that silently does nothing is still worse than none, which is why anything left
+unproven is refused with its reason rather than offered.
 
 ## Tests
 
-    cargo test        # 89, none need hardware
+    cargo test        # 99, none need hardware
 
 ## Roadmap
 
