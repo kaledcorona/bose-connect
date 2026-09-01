@@ -14,6 +14,7 @@ use crate::codec::*;
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::transport::Transport;
+use crate::wire::{Addr, Message, Operator};
 
 /// A setting that is simply on or off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,14 +270,74 @@ impl<T: Transport> Device<T> {
             .collect())
     }
 
-    /// The index of the mode currently active. Reading works; the write does
-    /// not, and [`Device::set`] says so from the catalog rather than from here.
+    /// The index of the mode currently active.
     pub fn current_mode(&mut self) -> Result<u8> {
         self.get(&CURRENT_MODE)
     }
 
+    /// Switch to the mode at `index`, silently.
     pub fn select_mode(&mut self, index: u8) -> Result<()> {
-        self.set(&CURRENT_MODE, index)
+        self.select_mode_announce(index, false)
+    }
+
+    /// Write a mode into its slot — create one in an empty slot, or edit an
+    /// existing one by building a [`ModeConfig`] from it.
+    ///
+    /// The write is a shorter record than a read returns, so it goes through a
+    /// [`ModeConfig`] rather than a [`Mode`]; see [`crate::codec::set_mode`]. Reversible
+    /// on a slot you own — write it again, or [`Device::reset_mode`] a
+    /// user-created one back to default.
+    ///
+    /// ```no_run
+    /// # use bose_connect::device::Device;
+    /// # use bose_connect::codec::ModeConfig;
+    /// # use bose_connect::transport::Transport;
+    /// # fn f<T: Transport>(dev: &mut Device<T>) -> bose_connect::error::Result<()> {
+    /// let modes = dev.modes()?;
+    /// let mut cfg = ModeConfig::from_mode(&modes[3]);
+    /// cfg.wind_block = Some(true);
+    /// dev.save_mode(cfg)?;
+    /// # Ok(()) }
+    /// ```
+    pub fn save_mode(&mut self, config: ModeConfig) -> Result<()> {
+        self.set(&MODE_SLOT, config)
+    }
+
+    /// Reset a mode slot to its factory default. On a user-created mode this
+    /// discards it; on a factory one it is a no-op. Not reversible for a mode
+    /// the user built by hand.
+    pub fn reset_mode(&mut self, index: u8) -> Result<()> {
+        let addr = MODE_SLOT.meta.addr;
+        if !self.has(&MODE_SLOT) && !self.has(&CURRENT_MODE) {
+            return Err(Error::Absent(addr));
+        }
+        // 1f 09 Reset, a Start carrying the index; the reply is a Result.
+        let request = Message::new(Addr::at(0x1f, 0x09), Operator::Start, vec![index]);
+        self.session().exchange(&request, Addr::at(0x1f, 0x09)).map(|_| ())
+    }
+
+    /// Switch to the mode at `index`; `announce` plays its spoken prompt.
+    ///
+    /// This is a verb rather than `set(CURRENT_MODE, …)` because selection is
+    /// not a write in the catalog's sense. The wire form is a `Start` of
+    /// `<index> <announce>`, and the reply is a `Result` carrying the mode the
+    /// device ended on — which is checked against `index`. A plain `SetGet` to
+    /// `1f 03`, which the catalog's write path would send, is refused; that is
+    /// why the catalog marks the write ineffective and the real thing lives
+    /// here.
+    pub fn select_mode_announce(&mut self, index: u8, announce: bool) -> Result<()> {
+        let addr = CURRENT_MODE.meta.addr;
+        if !self.has(&CURRENT_MODE) {
+            return Err(Error::Absent(addr));
+        }
+        let request = Message::new(addr, Operator::Start, vec![index, u8::from(announce)]);
+        let reply = self.session().exchange(&request, addr)?;
+        match reply.first() {
+            Some(&landed) if landed == index => Ok(()),
+            // A Result that names a different mode, or carries nothing: the
+            // request was not refused but did not do what was asked.
+            _ => Err(Error::Malformed { addr, got: reply }),
+        }
     }
 }
 
@@ -428,17 +489,44 @@ mod tests {
         );
         // Byte 46 is wind block, not occupancy: Quiet has it off and is real.
         assert!(!modes[0].wind_block && modes[4].wind_block);
-        assert_eq!(modes[3].awareness, 5);
+        assert_eq!(modes[3].cnc_level, 5);
         assert!(qc35().modes().is_err());
     }
 
     #[test]
-    fn selecting_a_mode_is_refused_because_it_does_not_work() {
-        // The app's form is accepted by the device and changes nothing, for
-        // every index. A control that silently does nothing is worse than none.
+    fn selecting_a_mode_switches_it_by_a_start_not_a_write() {
+        // A plain write to 1f 03 is refused; selection is a Start of
+        // <index> <announce>, and the Result names the mode landed on.
         let mut d = ultra();
         assert_eq!(d.current_mode().unwrap(), 0);
-        assert!(matches!(d.select_mode(1), Err(Error::NotUnderstood { .. })));
+        assert!(d.select_mode(3).is_ok());
+        assert!(d.select_mode_announce(1, true).is_ok());
+        // The catalog still refuses the write path: `set` sends a SetGet, which
+        // the device does not accept for this opcode.
+        assert!(matches!(d.set(&CURRENT_MODE, 1), Err(Error::NotUnderstood { .. })));
+    }
+
+    #[test]
+    fn selecting_a_mode_a_model_lacks_is_absent() {
+        // The QC35 has no modes function, so this never reaches the wire.
+        assert!(matches!(qc35().select_mode(1), Err(Error::Absent(_))));
+    }
+
+    #[test]
+    fn a_mode_is_written_through_the_evidence_gate() {
+        // The fixture accepts exactly the bytes the encoder produces, so this
+        // exercises the real write path end to end.
+        let mut d = ultra();
+        assert!(d.save_mode(fixtures::wind_test_config()).is_ok());
+        // A model without the modes function refuses before the wire.
+        assert!(qc35().save_mode(fixtures::wind_test_config()).is_err());
+    }
+
+    #[test]
+    fn a_mode_is_reset_by_index() {
+        let mut d = ultra();
+        assert!(d.reset_mode(9).is_ok());
+        assert!(matches!(qc35().reset_mode(9), Err(Error::Absent(_))));
     }
 
     #[test]

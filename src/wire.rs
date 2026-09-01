@@ -38,19 +38,27 @@ impl fmt::Display for Addr {
 /// mistake is easy enough to make that [`Record::refusal`] exists to name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
-    /// Unsolicited; the device volunteered this.
+    /// Wire name `Set`: a write with no reply. This client never sends one — it
+    /// writes with [`Operator::SetGet`] to have the change confirmed — so every
+    /// `0x00` it sees arrives *from* the device, unsolicited, which is a
+    /// notification. Named for that inbound use.
     Notify,
     Get,
-    Set,
+    /// Wire name `SetGet`: write, and return the new value. This is why a
+    /// confirmed write echoes back the record it set.
+    SetGet,
     /// A reply carrying state.
     Status,
     /// Refused. The payload says why; see [`Refusal`].
     Error,
     /// Begins an enumeration, and starts some operations.
     Start,
-    /// Ends an enumeration. Zero length.
-    End,
+    /// `Result`: the record that closes an enumeration, and the reply to an
+    /// operation. Zero length at the end of a listing.
     Result,
+    /// `Processing`: accepted, working. Acknowledges an enumeration before its
+    /// records arrive, and a long operation before its outcome.
+    Processing,
     Unknown(u8),
 }
 
@@ -59,12 +67,12 @@ impl From<u8> for Operator {
         match b {
             0x00 => Operator::Notify,
             0x01 => Operator::Get,
-            0x02 => Operator::Set,
+            0x02 => Operator::SetGet,
             0x03 => Operator::Status,
             0x04 => Operator::Error,
             0x05 => Operator::Start,
-            0x06 => Operator::End,
-            0x07 => Operator::Result,
+            0x06 => Operator::Result,
+            0x07 => Operator::Processing,
             other => Operator::Unknown(other),
         }
     }
@@ -75,12 +83,12 @@ impl From<Operator> for u8 {
         match o {
             Operator::Notify => 0x00,
             Operator::Get => 0x01,
-            Operator::Set => 0x02,
+            Operator::SetGet => 0x02,
             Operator::Status => 0x03,
             Operator::Error => 0x04,
             Operator::Start => 0x05,
-            Operator::End => 0x06,
-            Operator::Result => 0x07,
+            Operator::Result => 0x06,
+            Operator::Processing => 0x07,
             Operator::Unknown(b) => b,
         }
     }
@@ -150,9 +158,10 @@ impl<'a> Record<'a> {
         }
     }
 
-    /// Whether this closes an enumeration.
+    /// Whether this closes an enumeration. The terminator is a zero-length
+    /// `Result`; the `Processing` that opens the listing is not it.
     pub fn is_terminator(&self) -> bool {
-        self.operator == Operator::End && self.payload.is_empty()
+        self.operator == Operator::Result && self.payload.is_empty()
     }
 
     pub fn to_message(self) -> Message {
@@ -183,8 +192,10 @@ impl Message {
         Message::new(addr, Operator::Get, Vec::new())
     }
 
+    /// A write. Uses `SetGet`, so the device echoes the record it set — which is
+    /// how a write is confirmed rather than assumed.
     pub fn set(addr: Addr, payload: Vec<u8>) -> Self {
-        Message::new(addr, Operator::Set, payload)
+        Message::new(addr, Operator::SetGet, payload)
     }
 
     /// Asks a function to list itself.

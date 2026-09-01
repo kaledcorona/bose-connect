@@ -409,42 +409,176 @@ pub fn immersive(p: &[u8]) -> Option<Immersive> {
     }
 }
 
-/// One stored mode, from a 47-byte `1f 06` record.
+/// One stored mode, from a `1f 06` record.
 ///
-/// `awareness` is the same inverted scale as [`Graded`]. `wind_block` forces
-/// cancellation to its maximum while on, so the level is not independently
-/// settable in that state.
+/// `awareness` is `cncLevel` on the same inverted scale as [`Graded`] — `0` is
+/// maximum cancellation. `wind_block` forces cancellation to its maximum while
+/// on, so the level is not independently settable in that state.
 ///
-/// Most of the record is still unidentified, so `raw` carries all 47 bytes.
+/// Most of the record is still unidentified, so `raw` carries every byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mode {
     pub index: u8,
     pub name: String,
-    pub awareness: u8,
+    /// Byte 42, `cncLevel`: `0` is maximum cancellation, `10` full
+    /// transparency. Named to match [`ModeConfig::cnc_level`], which writes it.
+    pub cnc_level: u8,
     pub wind_block: bool,
+    /// Byte 5. Not slot occupancy — an emptiness test built on it drops any
+    /// stored mode the user has not starred.
+    pub favorite: bool,
     pub raw: Vec<u8>,
 }
 
-/// Byte 5 is slot occupancy; an empty slot decodes to `None`.
+impl Mode {
+    /// Whether the user made or customised this mode. Byte 4, `userConfigured`.
+    ///
+    /// A factory mode reads `false` and, on these devices, is not the user's to
+    /// change — the settings the app lets you touch are on the modes you built.
+    /// A caller offering an editor uses this to decide which modes it applies to.
+    pub fn is_user_mode(&self) -> bool {
+        self.raw.get(4).is_some_and(|&b| b != 0)
+    }
+
+    /// The spatial-audio setting stored in the mode, where the record carries it
+    /// (byte 44, present on the Ultra Headphones' 47-byte record, absent on the
+    /// Earbuds II's shorter one).
+    pub fn spatial(&self) -> Option<Immersive> {
+        self.raw.get(44).and_then(|&b| immersive(&[b]))
+    }
+
+    /// The spoken-prompt id (byte 2) — which announcement the headphones play on
+    /// switching in. `0` is silent.
+    pub fn prompt(&self) -> u8 {
+        self.raw.get(2).copied().unwrap_or(0)
+    }
+
+    /// Auto noise-cancelling, byte 43 — the mode adjusts the level to the
+    /// surroundings rather than holding it fixed.
+    pub fn auto_cnc(&self) -> bool {
+        self.raw.get(43).is_some_and(|&b| b != 0)
+    }
+}
+
+/// The record is a fixed layout **truncated by capability**: 47 bytes on the
+/// Ultra Headphones, 44 on the QC Earbuds II, which stops before the spatial
+/// byte. The shared prefix runs through byte 43, so that is all this needs.
 ///
-/// Byte 46 is wind block and is `00` on any mode that does not use it, so
-/// reading *that* as occupancy silently drops real modes.
+/// An empty slot has no prompt — byte 2 is `0` on every placeholder across both
+/// generations, where a stored mode always names one. Earlier readings keyed on
+/// byte 5 (favorite) or byte 46 (wind block); both are settings a real mode can
+/// have clear, so both silently dropped real modes.
 pub fn mode(p: &[u8]) -> Option<Option<Mode>> {
-    if p.len() < 47 {
+    if p.len() < 44 {
         return None;
     }
-    if p[5] != 0x01 {
+    // The name occupies bytes 6..38; the settings tail begins at 41.
+    let name = String::from_utf8_lossy(p[6..38].split(|&b| b == 0).next().unwrap_or_default());
+    // An empty slot has no prompt *and* a placeholder name — the Ultra writes
+    // "None", the Earbuds II leaves it empty. Prompt alone is not enough: a
+    // user's mode can be silent (prompt 0) and is still a real mode, so keying
+    // on prompt only would drop it.
+    if p[2] == 0x00 && (name.is_empty() || name == "None") {
         return Some(None);
     }
-    // The name runs from byte 6 to the settings tail at byte 41.
-    let name = p[6..41].split(|&b| b == 0).next().unwrap_or_default();
+    // Wind block is byte 46, present only on the longer record.
+    let wind_block = p.get(46).is_some_and(|&b| b != 0);
     Some(Some(Mode {
         index: p[0],
-        name: String::from_utf8_lossy(name).to_string(),
-        awareness: p[42],
-        wind_block: p[46] != 0,
+        name: name.into_owned(),
+        cnc_level: p[42],
+        wind_block,
+        favorite: p[5] != 0,
         raw: p.to_vec(),
     }))
+}
+
+/// The writable half of a mode — the fields a `1f 06` write carries.
+///
+/// This is deliberately not [`Mode`]. The read record has three read-only
+/// booleans and gap bytes the write does not send, so a mode is edited by
+/// building one of these, never by writing a read back. [`ModeConfig::from_mode`]
+/// lifts the writable fields out of a record for the common case of changing one
+/// thing.
+///
+/// `spatial`, `wind_block` and `anc_toggle` are optional because the wire form
+/// appends each only when set: a device without spatial audio never receives the
+/// byte. `None` omits it, exactly as the official app does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeConfig {
+    pub index: u8,
+    /// The spoken prompt the headphones announce on switching in. `0` is
+    /// silent; the ids index a table of names — `1` Quiet, `2` Aware, `9`
+    /// Workout, `0x0d` Focus, `0x22` Immersion, and so on.
+    pub prompt: u8,
+    pub name: String,
+    /// `0` is maximum cancellation, `10` full transparency — the same inverted
+    /// scale as [`Graded`].
+    pub cnc_level: u8,
+    pub auto_cnc: bool,
+    /// Spatial audio: [`Immersive::Off`], `Still` (fixed to the room), `Motion`
+    /// (fixed to the head).
+    pub spatial: Option<Immersive>,
+    pub wind_block: Option<bool>,
+    pub anc_toggle: Option<bool>,
+}
+
+impl ModeConfig {
+    /// Lift the writable fields out of a stored [`Mode`], to change one and
+    /// write it back. Reads the record's `raw`, so a field the shorter
+    /// Earbuds II record omits comes back `None` and is left off the write too.
+    pub fn from_mode(m: &Mode) -> Self {
+        let r = &m.raw;
+        ModeConfig {
+            index: m.index,
+            prompt: r.get(2).copied().unwrap_or(0),
+            name: m.name.clone(),
+            cnc_level: r.get(42).copied().unwrap_or(0),
+            auto_cnc: r.get(43).is_some_and(|&b| b != 0),
+            spatial: r.get(44).and_then(|&b| immersive(&[b])),
+            wind_block: r.get(46).map(|&b| b != 0),
+            anc_toggle: r.get(47).map(|&b| b != 0),
+        }
+    }
+}
+
+/// Encode a mode for a `1f 06` write, in the official app's own layout
+/// (`createAudioModesConfigSetGetPayload`).
+///
+/// Shorter than the record it returns: index, prompt, a 32-byte NUL-terminated
+/// name, level, auto-CNC, then the optional tail. The app appends spatial, wind
+/// and ANC in that order, and when one of spatial/wind is set without the other
+/// it pads the missing one rather than leave a gap — so the bytes keep their
+/// positions. Faithfully reproduced, padding and all.
+pub fn set_mode(c: ModeConfig) -> Vec<u8> {
+    let mut p = Vec::with_capacity(40);
+    p.push(c.index);
+    p.push(0x00); // prompt's first byte is always 0
+    p.push(c.prompt);
+    // Name: 32 bytes, NUL-terminated, at most 31 characters.
+    let mut name = [0u8; 32];
+    let src = c.name.as_bytes();
+    let n = src.len().min(31);
+    name[..n].copy_from_slice(&src[..n]);
+    p.extend_from_slice(&name);
+    p.push(c.cnc_level);
+    p.push(u8::from(c.auto_cnc));
+    if let Some(s) = c.spatial {
+        p.push(s as u8);
+        if c.wind_block.is_none() {
+            p.push(0); // hold the wind slot open
+        }
+    }
+    if let Some(w) = c.wind_block {
+        if c.spatial.is_none() {
+            p.push(Immersive::Off as u8); // hold the spatial slot open
+        }
+        p.push(u8::from(w));
+    }
+    if let Some(a) = c.anc_toggle {
+        p.push(u8::from(a));
+    }
+    p
 }
 
 #[cfg(test)]
@@ -523,24 +657,121 @@ mod tests {
     }
 
     /// One 47-byte mode record the way a device sends it.
-    fn record(index: u8, occupied: bool, name: &str, awareness: u8, wind: u8) -> Vec<u8> {
-        let mut r = vec![0u8; 47];
+    /// `len` is 47 for an Ultra Headphones record and 44 for a QC Earbuds II
+    /// one. A stored mode always names a prompt at byte 2; a placeholder has 0.
+    fn record(len: usize, index: u8, prompt: u8, name: &str, awareness: u8, wind: u8) -> Vec<u8> {
+        let mut r = vec![0u8; len];
         r[0] = index;
-        r[5] = u8::from(occupied);
+        r[2] = prompt;
         r[6..6 + name.len()].copy_from_slice(name.as_bytes());
         r[42] = awareness;
-        r[46] = wind;
+        if len > 46 {
+            r[46] = wind;
+        }
         r
     }
 
     #[test]
     fn a_stored_mode_with_wind_block_off_is_still_a_stored_mode() {
-        // Byte 46 is wind block, not occupancy. Every mode that does not use it
-        // carries 0 there, so filtering on it drops real modes.
-        let focus = mode(&record(3, true, "Focus", 0x05, 0x00)).unwrap().unwrap();
-        assert_eq!((focus.index, focus.name.as_str(), focus.awareness), (3, "Focus", 5));
+        // Byte 46 is wind block and byte 5 is favorite — neither marks occupancy,
+        // and a mode that has them clear is still a real mode. An empty slot has
+        // no prompt (byte 2 = 0); a stored one always names one.
+        let focus = mode(&record(47, 3, 0x0d, "Focus", 0x05, 0x00)).unwrap().unwrap();
+        assert_eq!((focus.index, focus.name.as_str(), focus.cnc_level), (3, "Focus", 5));
         assert!(!focus.wind_block);
-        assert_eq!(mode(&record(5, false, "None", 0x00, 0x00)).unwrap(), None);
+        assert_eq!(mode(&record(47, 5, 0x00, "None", 0x00, 0x00)).unwrap(), None);
+    }
+
+    #[test]
+    fn the_earbuds_ii_record_is_three_bytes_shorter_and_still_reads() {
+        // 44 bytes, no spatial/wind tail. A codec that demands 47 returns None
+        // and the whole mode table is unreadable on that generation.
+        let workout = mode(&record(44, 2, 0x09, "Workout", 0x03, 0x00)).unwrap().unwrap();
+        assert_eq!((workout.index, workout.name.as_str(), workout.cnc_level), (2, "Workout", 3));
+        assert!(!workout.wind_block);
+    }
+
+    #[test]
+    fn a_silent_user_mode_is_not_mistaken_for_an_empty_slot() {
+        // Prompt 0 means silent, not empty. A mode named "WindTest" with no
+        // announcement is real; only prompt 0 *and* a placeholder name is empty.
+        let m = mode(&record(47, 9, 0x00, "WindTest", 0x00, 0x01)).unwrap();
+        assert_eq!(m.unwrap().name, "WindTest");
+        assert_eq!(mode(&record(47, 9, 0x00, "", 0x00, 0x00)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_mode_write_is_the_app_s_shorter_layout_not_the_read_record() {
+        // The exact bytes the app builds for slot 9, silent, wind block on:
+        // index, prompt(2), 32-byte name, cnc, autoCNC, spatial, wind. 39 bytes,
+        // against the 47 a read returns — no read-only booleans, no gap.
+        let cfg = ModeConfig {
+            index: 9,
+            prompt: 0,
+            name: "WindTest".to_string(),
+            cnc_level: 0,
+            auto_cnc: false,
+            spatial: Some(Immersive::Off),
+            wind_block: Some(true),
+            anc_toggle: None,
+        };
+        let p = set_mode(cfg);
+        assert_eq!(p.len(), 39);
+        assert_eq!(&p[0..3], &[0x09, 0x00, 0x00]); // index, prompt
+        assert_eq!(&p[3..11], b"WindTest"); // name begins at 3, not 6
+        assert_eq!(&p[35..39], &[0x00, 0x00, 0x00, 0x01]); // cnc, autoCNC, spatial, wind
+    }
+
+    #[test]
+    fn the_tail_is_padded_the_way_the_app_pads_it() {
+        // Wind set without spatial still holds the spatial slot open, so wind
+        // lands in its position rather than shifting up a byte.
+        let base = ModeConfig {
+            index: 0,
+            prompt: 0,
+            name: String::new(),
+            cnc_level: 0,
+            auto_cnc: false,
+            spatial: None,
+            wind_block: None,
+            anc_toggle: None,
+        };
+        assert_eq!(set_mode(base.clone()).len(), 37); // no tail
+        let wind = ModeConfig { wind_block: Some(true), ..base.clone() };
+        assert_eq!(&set_mode(wind)[37..], &[0x00, 0x01]); // spatial padded, then wind
+        let spatial = ModeConfig { spatial: Some(Immersive::Motion), ..base };
+        assert_eq!(&set_mode(spatial)[37..], &[0x02, 0x00]); // spatial, then wind padded
+    }
+
+    #[test]
+    fn a_mode_reports_who_made_it_and_what_it_holds() {
+        // byte 4 userConfigured, byte 44 spatial (fixed-to-head = Motion),
+        // byte 2 prompt, byte 43 auto-CNC.
+        let mut r = record(47, 3, 0x0d, "Focus", 0x05, 0x00);
+        r[4] = 1; // user-created
+        r[44] = 2; // spatial: fixed to head
+        r[43] = 1; // auto-CNC on
+        let m = mode(&r).unwrap().unwrap();
+        assert!(m.is_user_mode());
+        assert_eq!(m.spatial(), Some(Immersive::Motion));
+        assert_eq!(m.prompt(), 0x0d);
+        assert!(m.auto_cnc());
+        // A factory mode (byte 4 clear) reads false.
+        let factory = mode(&record(47, 0, 0x01, "Quiet", 0x00, 0x00)).unwrap().unwrap();
+        assert!(!factory.is_user_mode());
+    }
+
+    #[test]
+    fn a_mode_round_trips_through_config_and_back() {
+        // Read a record, lift its writable fields, re-encode: the fields the
+        // write carries survive unchanged.
+        let read = record(47, 3, 0x0d, "Focus", 0x05, 0x00);
+        let m = mode(&read).unwrap().unwrap();
+        let cfg = ModeConfig::from_mode(&m);
+        assert_eq!((cfg.index, cfg.prompt, cfg.name.as_str(), cfg.cnc_level), (3, 0x0d, "Focus", 5));
+        let written = set_mode(cfg);
+        assert_eq!(&written[0..3], &[0x03, 0x00, 0x0d]);
+        assert_eq!(written[35], 5); // cnc level preserved
     }
 
     #[test]

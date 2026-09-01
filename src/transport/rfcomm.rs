@@ -163,6 +163,7 @@ impl Transport for Rfcomm {
     }
 }
 
+/// The kernel wants the six octets reversed: the opposite of how an address is
 /// written and of how bluez prints it. Getting this backwards connects to
 /// nothing, with no error that says why.
 pub(super) fn bdaddr(addr: Address) -> [u8; 6] {

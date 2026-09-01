@@ -8,11 +8,10 @@ use std::io::{self, ErrorKind};
 
 use super::{Recording, Transport};
 
-/// A transport that answers from a script instead of a device.
+/// Answers by turn: reply *n* to request *n*, whatever was asked.
 ///
-/// This is the reason [`Transport`] is a trait. Recorded exchanges from four
-/// models exercise code paths nobody could otherwise reach without owning all
-/// four.
+/// Enough for an exchange whose order is fixed and short. Where it is not, see
+/// [`Scripted`].
 pub struct Replay {
     pub replies: Vec<Option<Vec<u8>>>,
     pub sent: Vec<Vec<u8>>,

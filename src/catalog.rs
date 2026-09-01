@@ -179,7 +179,7 @@ catalog! {
     EQUALISER: Vec<Band> | (u8, i8) = (0x01, 0x07) "equaliser"
         read  Confirmed, codec::equaliser,
         write Confirmed, Some(codec::set_band),
-        note  "Ultra. <min> <max> <value> <band> per band; write <value> <band>, signed";
+        note  "RangeControl, which the equaliser uses. Ultra. <min> <max> <value> <band> per band; write <value> <band>, signed";
 
     SHORTCUT: Vec<u8> | u8 = (0x01, 0x09) "shortcut action"
         read  Unknown,   codec::raw,
@@ -201,10 +201,10 @@ catalog! {
         write Unknown,   None,
         note  "one write captured, never identified";
 
-    HEAD_DETECTION: bool = (0x01, 0x18) "head detection"
+    HEAD_DETECTION: bool = (0x01, 0x18) "auto play/pause"
         read  Confirmed, codec::flag,
         write Confirmed, Some(codec::set_flag),
-        note  "pause when they come off";
+        note  "AutoPlayPause: pause when they come off. Distinct from OnHeadDetection, which is 01 10";
 
     AUTO_ANSWER: bool = (0x01, 0x1b) "auto-answer on wearing"
         read  Confirmed, codec::flag,
@@ -218,27 +218,27 @@ catalog! {
         write Unknown,   None,
         note  "one byte on a QC35, <pct> ff ff <index> per cell on an Ultra";
 
-    CLOCK_02_0D: Vec<u8> = (0x02, 0x0d) "elapsed time, not state"
+    CLOCK_02_0D: Vec<u8> = (0x02, 0x0d) "battery log"
         read  Unknown,   codec::raw,
         write Unknown,   None,
-        note  "the ASCII 'empty' never varies; the trailing counter tracks time between reads";
+        note  "BatteryLog. The ASCII 'empty' never varies; the trailing counter tracks time between reads, so it is not device state";
 
-    CLOCK_02_0E: Vec<u8> = (0x02, 0x0e) "elapsed time, not state"
+    CLOCK_02_0E: Vec<u8> = (0x02, 0x0e) "battery log, raw"
         read  Unknown,   codec::raw,
         write Unknown,   None,
-        note  "always equal to 02 0d; a field that moves every read manufactures correlations";
+        note  "BatteryLogRaw. Equal to 02 0d here; a field that moves every read manufactures correlations";
 
     // -- 04, pairing --------------------------------------------------------
 
     PAIRED: Vec<Address> = (0x04, 0x04) "paired devices"
         read  Confirmed, codec::addresses,
         write Unknown,   None,
-        note  "<count> then one address each";
+        note  "ListDevices. A leading byte then one address each — the byte is not a count (01 before three on a QC35, 03 before three on an Ultra); possibly a connected-slot mask";
 
-    ACTIVE_DEVICE: Address = (0x04, 0x09) "active device"
+    ACTIVE_DEVICE: Address = (0x04, 0x09) "the app's own address"
         read  Confirmed, codec::address,
         write Unknown,   None,
-        note  "the host currently holding the link";
+        note  "AppAddress, not the active source — every model returns the same one, the host's";
 
     // -- 05, media ----------------------------------------------------------
 
@@ -273,9 +273,12 @@ catalog! {
 
     CURRENT_MODE: u8 = (0x1f, 0x03) "current mode"
         read  Confirmed, codec::byte,
-        write Ineffective("the app's form is accepted and changes nothing, for every index"),
+        write Ineffective("a plain SetGet is refused; selection is a Start of \
+                           <index> <prompt>, which Device::set does not send"),
               Some(codec::set_byte),
-        note  "Ultra. Reading tracks the earcup button; writing is not understood";
+        note  "Ultra. Reading tracks the selected mode. Selection is confirmed: \
+               1f 03 05 02 <index> <play voice prompt>, a Start, replying Result \
+               with the resulting index. Not a get/set field — it is an operation";
 
     REMEMBER_MODE: bool = (0x1f, 0x05) "remember my mode"
         read  Confirmed, codec::flag,
@@ -284,10 +287,10 @@ catalog! {
 
     /// One slot. The table is ten of these and arrives as an enumeration, so
     /// [`crate::api`] reads it with `enumerate` and this codec, not with `get`.
-    MODE_SLOT: Option<Mode> = (0x1f, 0x06) "mode table slot"
+    MODE_SLOT: Option<Mode> | codec::ModeConfig = (0x1f, 0x06) "mode table slot"
         read  Confirmed, codec::mode,
-        write Unknown,   None,
-        note  "47 bytes: byte 5 occupancy, byte 42 awareness, byte 46 wind block";
+        write Confirmed, Some(codec::set_mode),
+        note  "ModeConfig. Read 47 bytes on an Ultra HP, 44 on an Earbuds II: byte 2 prompt (0 = empty), 42 cncLevel, 46 wind block, byte 5 favorite not occupancy. The write is a shorter layout — see codec::set_mode — confirmed by writing wind block on and reading byte 46 back";
 
     MODE_SLOTS: u8 = (0x1f, 0x08) "mode slot count"
         read  Confirmed, codec::byte,
@@ -326,10 +329,11 @@ mod tests {
 
     #[test]
     fn an_unconfirmed_write_carries_a_reason_rather_than_an_encoder() {
-        // `1f 03` is the case this exists for: the app was seen sending it, the
-        // device acknowledges, and nothing changes.
+        // `1f 03` is the case this exists for: selection works, but as a Start
+        // of <index> <prompt>, which Device::set (a SetGet) does not send. So
+        // the byte codec here is not usable, and the reason says why.
         assert!(!CURRENT_MODE.meta.write.usable());
-        assert!(CURRENT_MODE.meta.write.why().contains("changes nothing"));
+        assert!(CURRENT_MODE.meta.write.why().contains("Start"));
         // And `01 05` has no captured write at all.
         assert_eq!(ANC_GRADED.meta.write, Unknown);
         assert!(ANC_GRADED.encode.is_none());

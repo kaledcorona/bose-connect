@@ -230,13 +230,14 @@ mod tests {
 
     #[test]
     fn a_write_with_no_confirmed_format_is_refused_by_the_catalog() {
-        // Not by a match arm here. `1f 03` is accepted by the device and
-        // changes nothing, and the reason travels with the record.
+        // Not by a match arm here. `1f 03` is selectable, but only as a Start
+        // of <index> <prompt> — which set does not send — so the byte codec is
+        // refused, and the reason travels with the record.
         let mut d = open(fixtures::ultra_hp());
         let Err(Error::NotUnderstood { why, .. }) = d.set(&CURRENT_MODE, 1) else {
             panic!("a write with no confirmed format was sent");
         };
-        assert!(why.contains("changes nothing"));
+        assert!(why.contains("Start"));
         // And `01 05` was never captured at all.
         assert!(matches!(d.set(&ANC_GRADED, 5), Err(Error::NotUnderstood { .. })));
     }

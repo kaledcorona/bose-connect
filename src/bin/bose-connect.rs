@@ -32,7 +32,7 @@ const USAGE: &str = "usage: bose-connect [--channel N] <address> <command>
   eq                read the equaliser, with each band's range
   eq <band> <val>   set one band
   modes             list stored modes
-  mode              read the active mode index (selecting is not understood)
+  mode [index]      read the active mode, or switch to one by index
   immersive         read immersive audio
 
   language [en|es] [on|off]
@@ -67,7 +67,7 @@ enum Cmd {
     Anc(Option<Level>),
     Eq(Option<(u8, i8)>),
     Modes,
-    Mode,
+    Mode(Option<u8>),
     Immersive,
     Language(Option<(Language, Option<bool>)>),
     Name(Option<String>),
@@ -133,7 +133,8 @@ fn command(name: &str, rest: &[String]) -> std::result::Result<Cmd, Usage> {
         ("eq", []) => Cmd::Eq(None),
         ("eq", [band, value]) => Cmd::Eq(Some((dec(band)?, signed(value)?))),
         ("modes", []) => Cmd::Modes,
-        ("mode", []) => Cmd::Mode,
+        ("mode", []) => Cmd::Mode(None),
+        ("mode", [n]) => Cmd::Mode(Some(dec(n)?)),
         ("immersive", []) => Cmd::Immersive,
         ("language", []) => Cmd::Language(None),
         ("language", [l]) => Cmd::Language(Some((language(l)?, None))),
@@ -270,10 +271,11 @@ fn run<T: Transport>(cmd: &Cmd, dev: &mut Device<T>, channel: u8, out: &mut impl
         Cmd::Modes => {
             for m in dev.modes()? {
                 let wind = if m.wind_block { "  wind block" } else { "" };
-                writeln!(out, "{}  {:<20} awareness {}{}", m.index, m.name, m.awareness, wind)?;
+                writeln!(out, "{}  {:<20} cancelling {}{}", m.index, m.name, m.cnc_level, wind)?;
             }
         }
-        Cmd::Mode => writeln!(out, "{}", dev.current_mode()?)?,
+        Cmd::Mode(None) => writeln!(out, "{}", dev.current_mode()?)?,
+        Cmd::Mode(Some(index)) => dev.select_mode(*index)?,
         Cmd::Immersive => writeln!(out, "{}", immersive_name(dev.immersive()?))?,
         Cmd::Language(None) => {
             let p = dev.prompts()?;
@@ -534,6 +536,8 @@ mod tests {
     #[test]
     fn quantities_are_decimal_as_a_person_says_them() {
         assert_eq!(cmd(&format!("{MAC} volume 10")), Cmd::Volume(Some(10)));
+        assert_eq!(cmd(&format!("{MAC} mode")), Cmd::Mode(None));
+        assert_eq!(cmd(&format!("{MAC} mode 2")), Cmd::Mode(Some(2)));
         assert_eq!(cmd(&format!("{MAC} eq 0 -6")), Cmd::Eq(Some((0, -6))));
         assert_eq!(cmd(&format!("{MAC} auto-off 60")), Cmd::AutoOff(Some(AutoOff::After(60))));
         assert_eq!(cmd(&format!("{MAC} auto-off never")), Cmd::AutoOff(Some(AutoOff::Never)));
@@ -555,7 +559,7 @@ mod tests {
     fn every_word_is_checked_before_a_socket_is_opened() {
         // Each of these used to connect, probe every channel, discover the
         // surface, and then print usage.
-        for bad in ["anc medium", "language de", "language en maybe", "toggle nonsense", "eq 0", "raw 1f", "mode 3"] {
+        for bad in ["anc medium", "language de", "language en maybe", "toggle nonsense", "eq 0", "raw 1f", "mode x"] {
             let r = parse(&args(&format!("{MAC} {bad}")));
             assert!(r.is_err(), "{bad} was accepted");
         }

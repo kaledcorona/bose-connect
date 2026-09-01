@@ -24,13 +24,14 @@ fn refusal(f: u8, o: u8, code: u8) -> Vec<u8> {
     bytes(Addr::at(f, o), Operator::Error, &[code])
 }
 
-/// A function listing itself: an empty result, the records, then a terminator.
+/// A function listing itself: `Processing` acknowledges it, the records follow
+/// as `Status`, then a zero-length `Result` closes it.
 fn listing(f: u8, records: &[(u8, &[u8])]) -> Vec<u8> {
-    let mut out = bytes(Addr::at(f, 0x01), Operator::Result, &[]);
+    let mut out = bytes(Addr::at(f, 0x01), Operator::Processing, &[]);
     for (o, p) in records {
         out.extend_from_slice(&status(f, *o, p));
     }
-    out.extend_from_slice(&bytes(Addr::at(f, 0x01), Operator::End, &[]));
+    out.extend_from_slice(&bytes(Addr::at(f, 0x01), Operator::Result, &[]));
     out
 }
 
@@ -66,6 +67,40 @@ impl Profile {
         self.0 = self.0.on(&[f, 0x01, 0x05, 0x00], &listing(f, records));
         for (o, p) in records {
             self.0 = self.0.on(&[f, *o, 0x01, 0x00], &status(f, *o, p));
+        }
+        self
+    }
+
+    /// Mode selection: a `Start` of `<index> <announce>` answered by a `Result`
+    /// carrying the mode the device settled on. Scripts both prompt values for
+    /// every index in `0..slots`, so a caller can select any of them.
+    fn selects(mut self, slots: u8) -> Self {
+        for index in 0..slots {
+            for announce in [0x00, 0x01] {
+                let request = [0x1f, 0x03, 0x05, 0x02, index, announce];
+                let reply = bytes(Addr::at(0x1f, 0x03), Operator::Result, &[index]);
+                self.0 = self.0.on(&request, &reply);
+            }
+        }
+        self
+    }
+
+    /// Accept one mode write: the exact SetGet payload `written`, answered by a
+    /// Status carrying `stored` in read format — what the device echoes back.
+    fn saves_mode(mut self, written: &[u8], stored: &[u8]) -> Self {
+        let mut req = vec![0x1f, 0x06, 0x02, written.len() as u8];
+        req.extend_from_slice(written);
+        self.0 = self.0.on(&req, &status(0x1f, 0x06, stored));
+        self
+    }
+
+    /// Mode reset: a `Start` of `<index>` at `1f 09`, answered by an empty
+    /// `Result`, for every index in `0..slots`.
+    fn resets(mut self, slots: u8) -> Self {
+        for index in 0..slots {
+            let request = [0x1f, 0x09, 0x05, 0x01, index];
+            let reply = bytes(Addr::at(0x1f, 0x09), Operator::Result, &[]);
+            self.0 = self.0.on(&request, &reply);
         }
         self
     }
@@ -159,6 +194,15 @@ pub fn ultra_hp() -> Scripted {
         .opaque(0x07)
         .lists(0x1f, &modes())
         .writable(0x1f, 0x05, &[0x01], &[&[0x00], &[0x01]])
+        .selects(10)
+        // Accept the one write the mode-write test makes, echoing the slot with
+        // wind block now on. The request bytes come from the real encoder, so
+        // the fixture and the code under test cannot drift apart.
+        .saves_mode(
+            &crate::codec::set_mode(wind_test_config()),
+            slot(9, Some(("WindTest", 0)), 0, 1),
+        )
+        .resets(10)
         .done()
 }
 
@@ -179,13 +223,19 @@ pub fn sport() -> Scripted {
         .done()
 }
 
-/// Ten mode slots: five stored, five empty. Kaled's own, from the capture.
+/// Ten mode slots: five stored, five empty. Kaled's own, from the capture —
+/// each prompt id is the one the real record carries.
 fn modes() -> Vec<(u8, &'static [u8])> {
-    const NAMES: [(&str, u8, u8); 5] =
-        [("Quiet", 0, 0), ("Aware", 10, 0), ("Immersion", 0, 0), ("Focus", 5, 0), ("Home", 8, 1)];
+    const NAMES: [(&str, u8, u8, u8); 5] = [
+        ("Quiet", 0x01, 0, 0),
+        ("Aware", 0x02, 10, 0),
+        ("Immersion", 0x22, 0, 0),
+        ("Focus", 0x0d, 5, 0),
+        ("Home", 0x0a, 8, 1),
+    ];
     let mut out: Vec<(u8, &'static [u8])> = Vec::new();
-    for (i, (name, awareness, wind)) in NAMES.iter().enumerate() {
-        out.push((0x06, slot(i as u8, Some(name), *awareness, *wind)));
+    for (i, (name, prompt, awareness, wind)) in NAMES.iter().enumerate() {
+        out.push((0x06, slot(i as u8, Some((name, *prompt)), *awareness, *wind)));
     }
     for i in 5..10u8 {
         out.push((0x06, slot(i, None, 0, 0)));
@@ -196,15 +246,30 @@ fn modes() -> Vec<(u8, &'static [u8])> {
     out
 }
 
-/// One 47-byte record. Byte 5 is occupancy, byte 42 awareness, byte 46 wind
-/// block — and byte 46 is `00` on any mode that does not use it, so it must
-/// never be read as occupancy.
-fn slot(index: u8, name: Option<&str>, awareness: u8, wind: u8) -> &'static [u8] {
+/// The mode the write test builds and the Ultra fixture accepts — one place, so
+/// they cannot disagree. A silent (prompt 0) mode in slot 9 with wind block on.
+pub fn wind_test_config() -> crate::codec::ModeConfig {
+    crate::codec::ModeConfig {
+        index: 9,
+        prompt: 0,
+        name: "WindTest".to_string(),
+        cnc_level: 0,
+        auto_cnc: false,
+        spatial: Some(crate::codec::Immersive::Off),
+        wind_block: Some(true),
+        anc_toggle: None,
+    }
+}
+
+/// One 47-byte record. Byte 2 is the prompt — `0` marks an empty slot, since a
+/// stored mode always names one. Byte 5 is favorite, byte 42 the cancellation
+/// level, byte 46 wind block; none of those three marks occupancy.
+fn slot(index: u8, mode: Option<(&str, u8)>, awareness: u8, wind: u8) -> &'static [u8] {
     let mut r = vec![0u8; 47];
     r[0] = index;
-    if let Some(n) = name {
-        r[5] = 0x01;
-        r[6..6 + n.len()].copy_from_slice(n.as_bytes());
+    if let Some((name, prompt)) = mode {
+        r[2] = prompt;
+        r[6..6 + name.len()].copy_from_slice(name.as_bytes());
         r[42] = awareness;
         r[46] = wind;
     }
