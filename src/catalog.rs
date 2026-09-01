@@ -169,7 +169,7 @@ catalog! {
     ANC_GRADED: Graded | u8 = (0x01, 0x05) "noise cancelling"
         read  Confirmed, codec::graded,
         write Unknown,   None,
-        note  "Ultra. 0b <awareness> 03, awareness = 10 - level; no write was ever captured";
+        note  "Ultra. 0b <awareness> 03, awareness = 10 - level. A SetGet is refused with 05 (operator not valid here); cancellation is set through a mode, not directly";
 
     ANC_NAMED: Named | Level = (0x01, 0x06) "noise cancelling"
         read  Confirmed, codec::named,

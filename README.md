@@ -218,15 +218,16 @@ The **[library guide](https://github.com/kaledcorona/bose-connect/wiki/Library)*
 covers the eight layers, the fixtures, and the three-answer error model — a
 request gets a value, a refusal, or silence, and the three are not the same.
 
-## Limits
+## Ultra cancellation is a mode, not a dial
 
-**Setting cancellation on an Ultra.** No capture of the official app writing
-`01 05` exists, so the format would be a guess. It sits in the catalog as
-`Unknown`, and the crate refuses it rather than send one.
+The QuietComfort 35 sets a raw cancellation level; the Ultra does not. `01 05`
+refuses a write — *operator not supported* — so there is no level to set
+directly. On the Ultra, cancellation lives in a **mode**: select one, or edit a
+mode's level and select it. Both work, and that is how the app does it too.
 
-Selecting, creating and editing modes — once listed here — are done. A control
-that silently does nothing is still worse than none, which is why anything left
-unproven is refused with its reason rather than offered.
+That is the crate's rule throughout. Where the device refuses, or a write has
+never been shown to take, it says so with the reason rather than offer a control
+that silently does nothing.
 
 ## Tests
 
